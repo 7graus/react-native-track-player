@@ -3,6 +3,7 @@ package com.doublesymmetry.trackplayer.service
 import android.annotation.SuppressLint
 import android.app.*
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Binder
@@ -13,6 +14,10 @@ import android.provider.Settings
 import android.view.KeyEvent
 import androidx.annotation.MainThread
 import androidx.annotation.OptIn
+import androidx.core.app.NotificationChannelCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.ServiceCompat
 import androidx.media.utils.MediaConstants
 import androidx.media3.common.C
 import androidx.media3.common.Player
@@ -24,6 +29,7 @@ import androidx.media3.common.Rating
 import androidx.media3.common.util.BitmapLoader
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.CommandButton
+import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionCommands
@@ -31,6 +37,7 @@ import androidx.media3.session.SessionResult
 import com.doublesymmetry.kotlinaudio.models.*
 import com.doublesymmetry.kotlinaudio.players.QueuedAudioPlayer
 import com.doublesymmetry.trackplayer.HeadlessJsMediaService
+import com.doublesymmetry.trackplayer.R
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toMilliseconds
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toSeconds
 import com.doublesymmetry.trackplayer.extensions.asLibState
@@ -166,6 +173,17 @@ class MusicService : HeadlessJsMediaService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         onStartCommandIntentValid = intent != null
         Timber.d("onStartCommand: ${intent?.action}, ${intent?.`package`}")
+        // A media button can start this service in the foreground while nothing is loaded:
+        // a Bluetooth/headset key (the session's media button receiver below API 31) or the Play
+        // button of a notification left behind by a killed process. Nothing will play and call
+        // startForeground, so the system would crash the app with "did not then call
+        // Service.startForeground()". Satisfy the contract and stop, like Media3 1.10's
+        // MediaSessionService.stopSelfSafely().
+        if (intent?.action == Intent.ACTION_MEDIA_BUTTON && !hasPlayableQueue()) {
+            Timber.w("Media button start with nothing to play, stopping the service safely")
+            stopSelfSafely(startId)
+            return START_NOT_STICKY
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
             // HACK: this is not supposed to be here. I definitely screwed up. but Why?
             onMediaKeyEvent(intent)
@@ -176,6 +194,50 @@ class MusicService : HeadlessJsMediaService() {
             super.onStartCommand(intent, flags, startId)
         }
         return START_STICKY
+    }
+
+    private fun hasPlayableQueue(): Boolean =
+        ::player.isInitialized && player.items.isNotEmpty()
+
+    @SuppressLint("InlinedApi") // FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK is ignored below API 29
+    private fun stopSelfSafely(startId: Int) {
+        try {
+            val channelId = getString(R.string.rntp_temporary_channel_id)
+            val notificationManager = NotificationManagerCompat.from(this)
+            notificationManager.createNotificationChannel(
+                NotificationChannelCompat.Builder(
+                    channelId,
+                    NotificationManagerCompat.IMPORTANCE_LOW
+                )
+                    .setName(getString(R.string.rntp_temporary_channel_name))
+                    .setShowBadge(false)
+                    .build()
+            )
+            val notification = NotificationCompat.Builder(this, channelId)
+                .setSmallIcon(androidx.media3.session.R.drawable.media3_notification_small_icon)
+                .setCategory(Notification.CATEGORY_SERVICE)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+                .setOnlyAlertOnce(true)
+                .setSilent(true)
+                .setOngoing(false)
+                // Android 12+ waits before showing it, so it is never displayed
+                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_DEFERRED)
+                .build()
+            ServiceCompat.startForeground(
+                this,
+                EMPTY_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            )
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            // The notification left behind by a killed process has no session behind it anymore
+            notificationManager.cancel(DefaultMediaNotificationProvider.DEFAULT_NOTIFICATION_ID)
+        } catch (e: Exception) {
+            // e.g. ForegroundServiceStartNotAllowedException when not started as foreground
+            Timber.e(e, "Could not start the service in the foreground before stopping it")
+        }
+        stopSelf(startId)
     }
 
     @MainThread
